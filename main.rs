@@ -3,6 +3,7 @@ use ethers::{
     providers::{Provider, Ws},
     utils::{parse_ether, format_ether},
     abi::{Token, encode},
+    types::transaction::eip2718::TypedTransaction,
 };
 use ethers_flashbots::{BundleRequest, FlashbotsMiddleware};
 use petgraph::{graph::{NodeIndex, UnGraph}, visit::EdgeRef};
@@ -10,9 +11,9 @@ use std::{sync::Arc, collections::HashMap, str::FromStr, net::TcpListener, io::W
 use colored::*;
 use dotenv::dotenv;
 use std::env;
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use url::Url;
-use log::{info, warn, error};
+use log::{info, error};
 
 #[derive(Clone, Debug)]
 struct ChainConfig {
@@ -20,7 +21,6 @@ struct ChainConfig {
     rpc_env: String,
     rpc_default: String,
     flashbots: String,
-    is_l2: bool,
 }
 
 abigen!(
@@ -61,7 +61,6 @@ async fn main() -> Result<()> {
 
     thread::spawn(|| {
         let listener = TcpListener::bind("0.0.0.0:8080").unwrap();
-        info!("Cloud Health Monitor Active on Port 8080");
         for stream in listener.incoming() {
             if let Ok(mut s) = stream {
                 let _ = s.write_all(b"HTTP/1.1 200 OK\r\n\r\n{\"status\":\"TITAN_ONLINE\"}");
@@ -70,7 +69,7 @@ async fn main() -> Result<()> {
     });
 
     let chains = vec![
-        ChainConfig { name: "ETHEREUM".into(), rpc_env: "ETH_RPC".into(), rpc_default: "wss://eth.llamarpc.com".into(), flashbots: "https://relay.flashbots.net".into(), is_l2: false },
+        ChainConfig { name: "ETHEREUM".into(), rpc_env: "ETH_RPC".into(), rpc_default: "wss://eth.llamarpc.com".into(), flashbots: "https://relay.flashbots.net".into() },
     ];
 
     let pk = env::var("PRIVATE_KEY")?;
@@ -87,7 +86,7 @@ async fn main() -> Result<()> {
         }));
     }
 
-    for h in handles { let _ = h.await; }
+    for h in handles { let _ = h.await?; }
     Ok(())
 }
 
@@ -148,15 +147,22 @@ async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String) -> Re
                         info!("[{}] 💎 OPPORTUNITY: {} ETH", config.name, format_ether(profit));
                         let bribe = profit * 90 / 100;
                         let strategy = build_strategy(route, amt_in, bribe, executor.address(), &graph)?;
-                        let tx = executor.execute(U256::zero(), Address::from_str(weth)?, amt_in, strategy).tx;
+                        let mut tx = executor.execute(U256::zero(), Address::from_str(weth)?, amt_in, strategy).tx;
 
-                        if let Some(fb) = fb_client.as_ref() {
-                            let block = provider.get_block_number().await?;
-                            let bundle = BundleRequest::new().push_transaction(tx).set_block(block + 1);
-                            let _ = fb.send_bundle(&bundle).await;
-                        } else {
-                            let http_url = rpc_url.replace("wss://", "https://").replace("ws://", "http://");
-                            saturation_strike(&client, &http_url, tx).await;
+                        // Sign transaction for saturation broadcast
+                        if let Ok(sig) = client.signer().sign_transaction(&tx).await {
+                            let signed_rlp = tx.rlp_signed(&sig);
+
+                            if let Some(fb) = fb_client.as_ref() {
+                                let block = provider.get_block_number().await?;
+                                let bundle = BundleRequest::new()
+                                    .push_transaction(signed_rlp.clone())
+                                    .set_block(block + 1);
+                                let _ = fb.send_bundle(&bundle).await;
+                            } else {
+                                let http_url = rpc_url.replace("wss://", "https://").replace("ws://", "http://");
+                                saturation_strike(&http_url, signed_rlp).await;
+                            }
                         }
                     }
                 }
@@ -166,18 +172,21 @@ async fn monitor_chain(config: ChainConfig, pk: String, exec_addr: String) -> Re
     Ok(())
 }
 
-async fn saturation_strike<M: Middleware + 'static>(client: &Arc<M>, rpc_url: &str, tx: TypedTransaction) {
-    if let Ok(signed_tx) = client.signer().sign_transaction(&tx).await {
-        let raw_tx = signed_tx.rlp();
-        let client_http = reqwest::Client::new();
-        let rpc = rpc_url.to_string();
-        let raw_tx_hex = format!("0x{}", hex::encode(&raw_tx));
-        tokio::spawn(async move {
-            let body = serde_json::json!({"jsonrpc": "2.0", "method": "eth_sendRawTransaction", "params": [raw_tx_hex], "id": 1});
-            let _ = client_http.post(rpc).json(&body).send().await;
+async fn saturation_strike(rpc_url: &str, signed_rlp: Bytes) {
+    let client_http = reqwest::Client::new();
+    let rpc = rpc_url.to_string();
+    let raw_tx_hex = format!("0x{}", hex::encode(&signed_rlp));
+    
+    tokio::spawn(async move {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "eth_sendRawTransaction",
+            "params": [raw_tx_hex],
+            "id": 1
         });
-        let _ = client.send_transaction(tx, None).await;
-    }
+        let _ = client_http.post(rpc).json(&body).send().await;
+    });
+    info!("🚀 Saturation Strike Sent");
 }
 
 fn validate_env() -> Result<()> {
